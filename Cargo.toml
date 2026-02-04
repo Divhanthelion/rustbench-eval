@@ -1,0 +1,49 @@
+[package]
+name = "rustbench-eval"
+version = "0.1.0"
+edition = "2021"
+description = "Rust code evaluation harness for LLM benchmarking"
+authors = ["RustBench-X"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client for LM Studio
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# File handling
+tempfile = "3"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Async trait support
+async-trait = "0.1"
+
+# Colored output
+colored = "2"
+
+# Regex for parsing
+regex = "1"
+
+# SQLite database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# For home directory detection
+dirs = "5"
+
+# Timestamps for run IDs
+chrono = "0.4"
+
+[[bin]]
+name = "rustbench"
+path = "src/main.rs"
