@@ -44,6 +44,12 @@ dirs = "5"
 # Timestamps for run IDs
 chrono = "0.4"
 
+# Progress bar
+indicatif = "0.17"
+
+# Async flow control
+futures = "0.3"
+
 [[bin]]
 name = "rustbench"
 path = "src/main.rs"

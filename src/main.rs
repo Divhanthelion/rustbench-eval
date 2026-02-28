@@ -7,7 +7,10 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use colored::*;
+use futures::stream::{self, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::fs;
 
@@ -60,6 +63,10 @@ enum Commands {
         /// Output file for results (JSONL)
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Number of concurrent tasks to run (default 1)
+        #[arg(short = 'j', long, default_value = "1")]
+        concurrency: usize,
     },
     
     /// Check if LM Studio is available
@@ -123,9 +130,9 @@ async fn main() -> Result<()> {
     }
     
     match cli.command {
-        Commands::Run { tasks, url, model, temperature, max_tokens, miri, timeout, output } => {
+        Commands::Run { tasks, url, model, temperature, max_tokens, miri, timeout, output, concurrency } => {
             let db = Database::new(&db_path).await.ok();
-            run_evaluation(&tasks, &url, &model, temperature, max_tokens, miri, timeout, output.as_deref(), db.as_ref()).await
+            run_evaluation(&tasks, &url, &model, temperature, max_tokens, miri, timeout, output.as_deref(), db.as_ref(), concurrency).await
         }
         Commands::Check { url } => {
             check_connection(&url).await
@@ -161,6 +168,7 @@ async fn run_evaluation(
     timeout_secs: u64,
     output: Option<&std::path::Path>,
     db: Option<&Database>,
+    concurrency: usize,
 ) -> Result<()> {
     println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
     println!("{}", "║           RustBench-X Evaluation Pipeline                 ║".cyan());
@@ -168,7 +176,7 @@ async fn run_evaluation(
     println!();
     
     // Check LM Studio
-    let lm = LmStudio::new(url, model);
+    let lm = Arc::new(LmStudio::new(url, model));
     if !lm.health_check().await? {
         println!("{} LM Studio not available at {}", "[ERROR]".red(), url);
         return Ok(());
@@ -188,14 +196,17 @@ async fn run_evaluation(
         .context("Failed to parse tasks")?;
     
     println!("{} Loaded {} tasks", "[INFO]".blue(), tasks.len());
+    if concurrency > 1 {
+        println!("{} Running with concurrency: {}", "[INFO]".blue(), concurrency);
+    }
     println!();
 
-    let evaluator = Evaluator::new(run_miri, timeout_secs);
-    let mut results: Vec<TaskResult> = Vec::new();
+    let evaluator = Arc::new(Evaluator::new(run_miri, timeout_secs));
+    let db = db.map(Arc::new);
 
     // Create a run record in the database
     let run_id = format!("run_{}", Utc::now().format("%Y%m%d_%H%M%S"));
-    if let Some(db) = db {
+    if let Some(db) = &db {
         let config = GenerationConfig {
             temperature,
             max_tokens,
@@ -209,50 +220,87 @@ async fn run_evaluation(
 
     let total_start = Instant::now();
 
-    for (i, task) in tasks.iter().enumerate() {
-        println!(
-            "{} [{}/{}] {} ({})",
-            "[TASK]".yellow(),
-            i + 1,
-            tasks.len(),
-            task.task_id,
-            tier_to_string(&task.tier)
-        );
-        
-        // Generate code
-        let gen_start = Instant::now();
-        let code = match lm.generate_code(
-            &task.prompt,
-            &task.signature,
-            &task.context_code,
-            temperature,
-            max_tokens,
-        ).await {
-            Ok(c) => c,
-            Err(e) => {
-                println!("  {} Generation failed: {}", "[ERROR]".red(), e);
-                continue;
+    // Setup progress bar
+    let pb = ProgressBar::new(tasks.len() as u64);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+        .unwrap()
+        .progress_chars("#>-"));
+    
+    let run_id_arc = Arc::new(run_id);
+    let model_arc = Arc::new(model.to_string());
+
+    let results: Vec<TaskResult> = stream::iter(tasks)
+        .map(|task| {
+            let lm = Arc::clone(&lm);
+            let evaluator = Arc::clone(&evaluator);
+            let db = db.as_ref().map(Arc::clone);
+            let run_id = Arc::clone(&run_id_arc);
+            let model_name = Arc::clone(&model_arc);
+            let pb = pb.clone();
+            
+            async move {
+                pb.set_message(format!("Running {}", task.task_id));
+                
+                // Generate code
+                let gen_start = Instant::now();
+                let code = match lm.generate_code(
+                    &task.prompt,
+                    &task.signature,
+                    &task.context_code,
+                    temperature,
+                    max_tokens,
+                ).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        pb.println(format!("  {} Generation failed for {}: {}", "[ERROR]".red(), task.task_id, e));
+                        return None;
+                    }
+                };
+                let gen_time = gen_start.elapsed().as_millis() as u64;
+                
+                // Evaluate
+                let mut result = match evaluator.evaluate(&task, &code).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        pb.println(format!("  {} Evaluation failed for {}: {}", "[ERROR]".red(), task.task_id, e));
+                        return None;
+                    }
+                };
+                result.generation_time_ms = gen_time;
+                
+                // Log brief status to console (above progress bar)
+                let status_icon = if result.compiles { "✓".green() } else { "✗".red() };
+                let score_color = if result.scores.rpi >= 0.8 { result.scores.rpi.to_string().green() }
+                                  else if result.scores.rpi >= 0.5 { result.scores.rpi.to_string().yellow() }
+                                  else { result.scores.rpi.to_string().red() };
+                
+                pb.println(format!(
+                    "  {} {} | RPI: {} | Tests: {}/{}", 
+                    status_icon, 
+                    task.task_id, 
+                    score_color,
+                    result.tests_passed,
+                    result.tests_total
+                ));
+                
+                // Save to database
+                if let Some(db) = db {
+                    if let Err(e) = db.save_result(&result, &model_name, Some(&run_id)).await {
+                         pb.println(format!("  {} Database save failed: {}", "[WARN]".yellow(), e));
+                    }
+                }
+                
+                pb.inc(1);
+                Some(result)
             }
-        };
-        let gen_time = gen_start.elapsed().as_millis() as u64;
-        
-        // Evaluate
-        let mut result = evaluator.evaluate(task, &code).await?;
-        result.generation_time_ms = gen_time;
-        
-        // Print result summary
-        print_result_summary(&result);
-        
-        // Save to database if available
-        if let Some(db) = db {
-            if let Err(e) = db.save_result(&result, model, Some(&run_id)).await {
-                eprintln!("  {} Failed to save to database: {}", "[WARN]".yellow(), e);
-            }
-        }
-        
-        results.push(result);
-        println!();
-    }
+        })
+        .buffer_unordered(concurrency)
+        .filter_map(|r| async { r })
+        .collect()
+        .await;
+
+    pb.finish_with_message("Done");
     
     // Print summary
     print_final_summary(&results, total_start.elapsed().as_secs());

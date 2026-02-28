@@ -238,6 +238,15 @@ fn build_code_prompt(prompt: &str, signature: &str, context: &str) -> String {
 
 /// Extract code from LLM response (handles markdown code blocks)
 fn extract_code(response: &str) -> String {
+    // Strip <think>...</think> blocks produced by reasoning models (e.g. Nemotron, DeepSeek-R1)
+    let stripped;
+    let response = if response.contains("</think>") {
+        let after = response.splitn(2, "</think>").nth(1).unwrap_or(response);
+        stripped = after.trim().to_string();
+        stripped.as_str()
+    } else {
+        response
+    };
     let response = response.trim();
 
     if response.contains("```") {
@@ -260,6 +269,21 @@ fn extract_code(response: &str) -> String {
 
         if !code_lines.is_empty() {
             return code_lines.join("\n");
+        }
+    }
+
+    // Fallback for free-form thinking models (e.g. "Thinking Process:\n\n...") that don't
+    // use XML tags or fences: skip leading prose until we hit a line that opens with a
+    // top-level Rust keyword.
+    let rust_starters = ["pub ", "fn ", "use ", "struct ", "enum ", "impl ", "type ",
+                         "const ", "static ", "mod ", "extern ", "trait ", "#[", "async "];
+    let lines: Vec<&str> = response.lines().collect();
+    if let Some(first_rust) = lines.iter().position(|l| {
+        let t = l.trim();
+        rust_starters.iter().any(|kw| t.starts_with(kw))
+    }) {
+        if first_rust > 0 {
+            return lines[first_rust..].join("\n");
         }
     }
 
